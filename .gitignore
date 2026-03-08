@@ -231,3 +231,7 @@ $RECYCLE.BIN/
 
 # Executable files
 *.exe
+
+# Saved images
+*.png
+images/

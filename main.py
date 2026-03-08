@@ -1,9 +1,11 @@
-import json
 import os
 import sys
+import uuid
+import hashlib
+import shutil
 
-from PyQt6.QtCore import Qt, QTimer, QPoint
-from PyQt6.QtGui import QColor, QAction
+from PyQt6.QtCore import Qt, QTimer, QPoint, QSize
+from PyQt6.QtGui import QColor, QAction, QImage, QPixmap, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
     QLabel,
@@ -17,24 +19,29 @@ from PyQt6.QtWidgets import (
     QMenu,
 )
 
-
 class ClipboardManager(QWidget):
     WINDOW_TITLE = "Clipboard history"
-    STORAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clipboard_history.json")
-    MAX_HISTORY_SAVE = 20
-    MIN_WIDTH, MIN_HEIGHT = 370, 600 # Increased height slightly for new UI element
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    IMAGE_DIR = os.path.join(BASE_DIR, ".images")
+
+    MAX_HISTORY_SAVE = 50
+    MIN_WIDTH, MIN_HEIGHT = 370, 600
     CLIPBOARD_CHECK_INTERVAL = 500
     RESTORE_TIMER_DELAY = 800
     MAX_DISPLAY_LENGTH = 40
     TRUNCATION_SUFFIX, TRUNCATION_OFFSET = "...", 37
+    ICON_SIZE = QSize(40, 40)
 
     def __init__(self) -> None:
-        """Initialize the clipboard manager with all necessary components.
-
-        Sets up the window, icons, system tray, UI components, styling, and clipboard monitoring.
-        Loads saved history from disk and captures the initial clipboard content.
-        """
+        """Initialize the manager for a fresh session."""
         super().__init__()
+
+        # --- STARTUP CLEANUP ---
+        # Wipe old images every time the app starts for a fresh slate
+        if os.path.exists(self.IMAGE_DIR):
+            shutil.rmtree(self.IMAGE_DIR)
+        os.makedirs(self.IMAGE_DIR)
+
         self._setup_window()
         self._setup_icons()
         self._setup_system_tray()
@@ -42,67 +49,60 @@ class ClipboardManager(QWidget):
         self._apply_styling()
         self._setup_clipboard_monitoring()
 
-        # Load saved items first, then capture current clipboard
-        self._load_history_from_disk()
+        # ONLY load what is currently on the clipboard right now
         self._load_initial_clipboard()
 
         self._connect_signals()
 
-    # --- NEW: PERSISTENCE LOGIC ---
-
-    def _save_history_to_disk(self) -> None:
-        """Saves the last 20 items to a JSON file."""
-        data_to_save = []
-        # We only save up to the last 20 items
-        count = min(self.list_widget.count(), self.MAX_HISTORY_SAVE)
-
-        for index in range(count):
+    def _cleanup_orphaned_images(self) -> None:
+        """Delete image files that are no longer in the top 20 list items."""
+        referenced_images = set()
+        for index in range(self.list_widget.count()):
             item = self.list_widget.item(index)
-            data_to_save.append({
-                "text": item.data(Qt.ItemDataRole.UserRole),
-                "pinned": item.data(Qt.ItemDataRole.UserRole + 1)
-            })
+            if item.data(Qt.ItemDataRole.UserRole + 2) == "image":
+                referenced_images.add(os.path.basename(item.data(Qt.ItemDataRole.UserRole)))
 
         try:
-            with open(self.STORAGE_FILE, 'w', encoding='utf-8') as file_handle:
-                json.dump(data_to_save, file_handle, ensure_ascii=False, indent=4)
-        except Exception as exception:
-            print(f"Failed to save history: {exception}")
-
-    def _load_history_from_disk(self) -> None:
-        """Loads items from the JSON file on startup."""
-        if not os.path.exists(self.STORAGE_FILE):
-            return
-
-        try:
-            with open(self.STORAGE_FILE, encoding='utf-8') as file_handle:
-                saved_items = json.load(file_handle)
-                # Load in reverse to maintain the 'newest at top' order during insertion
-                for item_data in reversed(saved_items):
-                    self._add_clipboard_item(
-                        item_data["text"],
-                        is_pinned=item_data.get("pinned", False)
-                    )
-        except Exception as exception:
-            print(f"Failed to load history: {exception}")
-
-    def closeEvent(self, event) -> None:
-        """Override closeEvent to ensure data is saved when app actually quits."""
-        self._save_history_to_disk()
-        event.accept()
-
-    # --- UPDATED METHODS ---
+            for filename in os.listdir(self.IMAGE_DIR):
+                if filename not in referenced_images:
+                    os.remove(os.path.join(self.IMAGE_DIR, filename))
+        except Exception as e:
+            print(f"Cleanup error: {e}")
 
     def _add_clipboard_item(self, text: str, is_pinned: bool = False) -> None:
         """Updated to support pre-pinned status from save file."""
         display_text = self._format_display_text(text)
         if is_pinned:
             display_text = f"📌 {display_text}"
-
         item = QListWidgetItem(display_text)
         item.setData(Qt.ItemDataRole.UserRole, text)
         item.setData(Qt.ItemDataRole.UserRole + 1, is_pinned)
+        item.setData(Qt.ItemDataRole.UserRole + 2, "text")
+        self._insert_and_style_item(item, is_pinned)
+        self._cleanup_orphaned_images() # Keep folder lean
 
+    def _add_image_item(self, content: any, is_pinned: bool = False, is_path: bool = False) -> None:
+        image_path = content if is_path else self._save_image_to_file(content)
+        if not image_path: return
+        display_text = "Image Snippet"
+        if is_pinned:
+            display_text = f"📌 {display_text}"
+        item = QListWidgetItem(display_text)
+        item.setData(Qt.ItemDataRole.UserRole, image_path)
+        item.setData(Qt.ItemDataRole.UserRole + 1, is_pinned)
+        item.setData(Qt.ItemDataRole.UserRole + 2, "image")
+        pixmap = QPixmap(image_path).scaled(self.ICON_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        item.setIcon(QIcon(pixmap))
+        self._insert_and_style_item(item, is_pinned)
+        self._cleanup_orphaned_images()
+
+    def _save_image_to_file(self, image: QImage) -> str:
+        filename = f"img_{uuid.uuid4().hex[:8]}.png"
+        path = os.path.join(self.IMAGE_DIR, filename)
+        if image.save(path, "PNG"): return path
+        return ""
+
+    def _insert_and_style_item(self, item: QListWidgetItem, is_pinned: bool) -> None:
         if is_pinned:
             item.setForeground(QColor("#ffcc00"))
             self.list_widget.insertItem(0, item)
@@ -110,10 +110,10 @@ class ClipboardManager(QWidget):
             insert_pos = self._get_first_non_pinned_index()
             self.list_widget.insertItem(insert_pos, item)
 
-        # Optional: Save every time a new item is added to be safe
-        self._save_history_to_disk()
+        # Enforce the 20 item limit in the UI immediately
+        while self.list_widget.count() > self.MAX_HISTORY_SAVE:
+            self.list_widget.takeItem(self.list_widget.count() - 1)
 
-    # --- REFACTORED CORE (Matches previous version) ---
 
     def _setup_window(self) -> None:
         """Configure the main window properties including title and minimum size."""
@@ -149,14 +149,10 @@ class ClipboardManager(QWidget):
     def _setup_ui_components(self) -> None:
         """Create and arrange the main UI components including search bar, label, and list widget."""
         self.layout = QVBoxLayout()
-
-        # New Feature: Real-time Clipboard Display
         self.current_label = QLabel("READY TO PASTE")
         self.current_display = QLineEdit()
         self.current_display.setObjectName("current_display")
         self.current_display.setReadOnly(True)
-        self.current_display.setPlaceholderText("Clipboard is empty")
-
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search history...")
 
@@ -166,8 +162,7 @@ class ClipboardManager(QWidget):
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-
-        # Add components to layout
+        self.list_widget.setIconSize(self.ICON_SIZE)
         self.layout.addWidget(self.current_label)
         self.layout.addWidget(self.current_display)
         self.layout.addWidget(self.search_bar)
@@ -178,17 +173,24 @@ class ClipboardManager(QWidget):
     def _setup_clipboard_monitoring(self) -> None:
         """Initialize clipboard monitoring with a timer to check for changes."""
         self.clipboard = QApplication.clipboard()
-        self.last_seen_text = self._get_current_clipboard_text()
+        self.last_seen_text = ""
+        self.last_seen_image_hash = ""
         self.timer = QTimer()
         self.timer.timeout.connect(self.check_clipboard)
         self.timer.start(self.CLIPBOARD_CHECK_INTERVAL)
 
     def _load_initial_clipboard(self) -> None:
-        """Load the current clipboard content as the first item if it's new and not empty."""
-        text = self._get_current_clipboard_text()
-        self.current_display.setText(text.replace('\n', ' '))
-        if text.strip() and self._is_new_clipboard_content(text):
-            self._add_clipboard_item(text)
+        mime = self.clipboard.mimeData()
+        if mime.hasImage():
+            img = self.clipboard.image()
+            self.last_seen_image_hash = self._get_image_hash(img)
+            self._update_current_display("[Image in Clipboard]")
+            self._add_image_item(img)
+        else:
+            txt = self._get_current_clipboard_text()
+            self.last_seen_text = txt
+            self._update_current_display(txt)
+            if txt.strip(): self._add_clipboard_item(txt)
 
     def _connect_signals(self) -> None:
         """Connect UI signals to their respective handler methods."""
@@ -197,42 +199,38 @@ class ClipboardManager(QWidget):
         self.search_bar.textChanged.connect(self._filter_list)
         self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
 
+    def _get_image_hash(self, image: QImage) -> str:
+        if image.isNull(): return ""
+        bits = image.constBits(); bits.setsize(image.sizeInBytes())
+        return hashlib.md5(bits).hexdigest()
+
+    def _update_current_display(self, text: str) -> None:
+        self.current_display.setText(text.replace('\n', ' '))
+        self.current_display.setCursorPosition(0)
+
     def _show_context_menu(self, position: QPoint) -> None:
         item = self.list_widget.itemAt(position)
         if not item: return
         menu = QMenu()
-        delete_action = QAction("Delete", self)
-        delete_action.triggered.connect(lambda: self._delete_item(item))
-        menu.addAction(delete_action)
-        menu.exec(self.list_widget.mapToGlobal(position))
+        del_act = QAction("Delete", self)
+        del_act.triggered.connect(lambda: self._delete_item(item))
+        menu.addAction(del_act); menu.exec(self.list_widget.mapToGlobal(position))
 
     def _delete_item(self, item: QListWidgetItem) -> None:
-        row = self.list_widget.row(item)
-        self.list_widget.takeItem(row)
-        self._save_history_to_disk()
+        self.list_widget.takeItem(self.list_widget.row(item))
+        self._cleanup_orphaned_images()
 
     def toggle_pin(self, item) -> None:
-        """Toggle the pin status of a clipboard item and reposition it accordingly.
-
-        Args:
-            item: The QListWidgetItem to toggle pin status for.
-        """
         is_pinned = not item.data(Qt.ItemDataRole.UserRole + 1)
-        text = item.data(Qt.ItemDataRole.UserRole)
-        # Remove and re-add to handle positioning logic properly
+        content = item.data(Qt.ItemDataRole.UserRole)
+        c_type = item.data(Qt.ItemDataRole.UserRole + 2)
         self.list_widget.takeItem(self.list_widget.row(item))
-        self._add_clipboard_item(text, is_pinned=is_pinned)
-        self._save_history_to_disk()
+        if c_type == "image": self._add_image_item(content, is_pinned=is_pinned, is_path=True)
+        else: self._add_clipboard_item(content, is_pinned=is_pinned)
 
     def _get_first_non_pinned_index(self) -> int:
-        """Find the index of the first non-pinned item in the list.
-
-        Returns:
-            int: Index where the first non-pinned item should be inserted.
-        """
-        for index in range(self.list_widget.count()):
-            if not self.list_widget.item(index).data(Qt.ItemDataRole.UserRole + 1):
-                return index
+        for i in range(self.list_widget.count()):
+            if not self.list_widget.item(i).data(Qt.ItemDataRole.UserRole + 1): return i
         return self.list_widget.count()
 
     def _filter_list(self, query: str) -> None:
@@ -242,9 +240,11 @@ class ClipboardManager(QWidget):
             query: The search string to filter items by.
         """
         query = query.lower()
-        for index in range(self.list_widget.count()):
-            item = self.list_widget.item(index)
-            full_text = item.data(Qt.ItemDataRole.UserRole).lower()
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            full_text = item.text().lower()
+            if item.data(Qt.ItemDataRole.UserRole + 2) == "text":
+                full_text = item.data(Qt.ItemDataRole.UserRole).lower()
             item.setHidden(query not in full_text)
 
     def _get_current_clipboard_text(self) -> str:
@@ -274,33 +274,23 @@ class ClipboardManager(QWidget):
         self.activateWindow()
 
     def check_clipboard(self) -> None:
-        """Monitor clipboard and update the real-time display."""
-        current_text = self._get_current_clipboard_text()
-
-        # Always update the real-time display widget
-        clean_display = current_text.replace('\n', ' ')
-        if self.current_display.text() != clean_display:
-            self.current_display.setText(clean_display)
-
-        # Logic for adding to history list
-        if current_text and current_text.strip() and current_text != self.last_seen_text:
-            if self._is_new_clipboard_content(current_text):
-                self.last_seen_text = current_text
-                self._add_clipboard_item(current_text)
+        mime = self.clipboard.mimeData()
+        if mime.hasImage():
+            img = self.clipboard.image()
+            if not img.isNull():
+                h = self._get_image_hash(img)
+                if h != self.last_seen_image_hash:
+                    self.last_seen_image_hash = h; self.last_seen_text = ""
+                    self._update_current_display("[Image Captured]")
+                    self._add_image_item(img)
+            return
+        txt = self._get_current_clipboard_text()
+        if txt and txt.strip():
+            self._update_current_display(txt)
+            if txt != self.last_seen_text:
+                self.last_seen_text = txt; self.last_seen_image_hash = ""
+                self._add_clipboard_item(txt)
                 self._filter_list(self.search_bar.text())
-
-    def _is_new_clipboard_content(self, text: str) -> bool:
-        """Check if the provided text is not already in the clipboard history.
-
-        Args:
-            text: The clipboard content to check for duplicates.
-
-        Returns:
-            bool: True if the text is new, False if it already exists in history.
-        """
-        existing_values = [self.list_widget.item(index).data(Qt.ItemDataRole.UserRole)
-                           for index in range(self.list_widget.count())]
-        return text not in existing_values
 
     def _format_display_text(self, text) -> str:
         """Format text for display in the list widget by removing newlines and truncating if necessary.
@@ -313,8 +303,7 @@ class ClipboardManager(QWidget):
         """
         display_text = text.replace('\n', ' ').strip()
         if len(display_text) > self.MAX_DISPLAY_LENGTH:
-            display_text = display_text[:self.TRUNCATION_OFFSET] + \
-                self.TRUNCATION_SUFFIX
+            display_text = display_text[:self.TRUNCATION_OFFSET] + self.TRUNCATION_SUFFIX
         return display_text
 
     def _copy_item_back(self, item) -> None:
@@ -325,11 +314,14 @@ class ClipboardManager(QWidget):
         """
         try:
             self.timer.stop()
-            text = item.data(Qt.ItemDataRole.UserRole)
-            self.clipboard.setText(text)
-            self.last_seen_text = text
-            # Update the display widget immediately on click
-            self.current_display.setText(text.replace('\n', ' '))
+            content = item.data(Qt.ItemDataRole.UserRole)
+            if item.data(Qt.ItemDataRole.UserRole + 2) == "image":
+                img = QImage(content); self.clipboard.setImage(img)
+                self.last_seen_image_hash = self._get_image_hash(img)
+                self._update_current_display("[Image Restored]")
+            else:
+                self.clipboard.setText(content); self.last_seen_text = content
+                self._update_current_display(content)
             QTimer.singleShot(self.RESTORE_TIMER_DELAY, self.timer.start)
         except Exception:
             QTimer.singleShot(self.RESTORE_TIMER_DELAY, self.timer.start)
