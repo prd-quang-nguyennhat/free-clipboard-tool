@@ -1,9 +1,9 @@
-import json  # Using JSON for cleaner structure than raw .txt
+import json
 import os
 import sys
 
-from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QColor
+from PyQt6.QtCore import Qt, QTimer, QPoint
+from PyQt6.QtGui import QColor, QAction
 from PyQt6.QtWidgets import (
     QApplication,
     QLabel,
@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
+    QMenu,
 )
 
 
@@ -21,7 +22,7 @@ class ClipboardManager(QWidget):
     WINDOW_TITLE = "Clipboard history"
     STORAGE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clipboard_history.json")
     MAX_HISTORY_SAVE = 20
-    MIN_WIDTH, MIN_HEIGHT = 370, 550
+    MIN_WIDTH, MIN_HEIGHT = 370, 600 # Increased height slightly for new UI element
     CLIPBOARD_CHECK_INTERVAL = 500
     RESTORE_TIMER_DELAY = 800
     MAX_DISPLAY_LENGTH = 40
@@ -131,27 +132,44 @@ class ClipboardManager(QWidget):
         self.tray_icon.activated.connect(self.on_tray_click)
 
     def _apply_styling(self) -> None:
-        """Apply dark theme styling to the application components."""
         style = """
             QWidget { background-color: #1e1e1e; }
             QLabel { color: #8e8e93; font-size: 11px; font-weight: bold; margin-left: 10px; margin-top: 5px; }
             QLineEdit { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555555; border-radius: 5px; padding: 8px; margin: 5px 10px; }
+            QLineEdit#current_display { background-color: #2d2d2d; color: #00ccff; border: 1px dashed #007aff; }
             QListWidget { border: none; background-color: #252526; border-radius: 8px; margin: 5px; outline: none; }
             QListWidget::item { padding: 12px; border-bottom: 1px solid #333333; color: #d4d4d4; }
             QListWidget::item:alternate { background-color: #2d2d2d; }
             QListWidget::item:selected { background-color: #094771; color: white; border-radius: 4px; }
+            QMenu { background-color: #252526; color: #d4d4d4; border: 1px solid #333333; }
+            QMenu::item:selected { background-color: #094771; }
         """
         self.setStyleSheet(style)
 
     def _setup_ui_components(self) -> None:
         """Create and arrange the main UI components including search bar, label, and list widget."""
         self.layout = QVBoxLayout()
+
+        # New Feature: Real-time Clipboard Display
+        self.current_label = QLabel("READY TO PASTE")
+        self.current_display = QLineEdit()
+        self.current_display.setObjectName("current_display")
+        self.current_display.setReadOnly(True)
+        self.current_display.setPlaceholderText("Clipboard is empty")
+
         self.search_bar = QLineEdit()
         self.search_bar.setPlaceholderText("Search history...")
-        self.label = QLabel("HISTORY (Double-click to Pin)")
+
+        self.label = QLabel("HISTORY (Double-click to Pin, Right-click to Delete)")
+
         self.list_widget = QListWidget()
         self.list_widget.setAlternatingRowColors(True)
         self.list_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        # Add components to layout
+        self.layout.addWidget(self.current_label)
+        self.layout.addWidget(self.current_display)
         self.layout.addWidget(self.search_bar)
         self.layout.addWidget(self.label)
         self.layout.addWidget(self.list_widget)
@@ -168,6 +186,7 @@ class ClipboardManager(QWidget):
     def _load_initial_clipboard(self) -> None:
         """Load the current clipboard content as the first item if it's new and not empty."""
         text = self._get_current_clipboard_text()
+        self.current_display.setText(text.replace('\n', ' '))
         if text.strip() and self._is_new_clipboard_content(text):
             self._add_clipboard_item(text)
 
@@ -176,6 +195,21 @@ class ClipboardManager(QWidget):
         self.list_widget.itemClicked.connect(self._copy_item_back)
         self.list_widget.itemDoubleClicked.connect(self.toggle_pin)
         self.search_bar.textChanged.connect(self._filter_list)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
+
+    def _show_context_menu(self, position: QPoint) -> None:
+        item = self.list_widget.itemAt(position)
+        if not item: return
+        menu = QMenu()
+        delete_action = QAction("Delete", self)
+        delete_action.triggered.connect(lambda: self._delete_item(item))
+        menu.addAction(delete_action)
+        menu.exec(self.list_widget.mapToGlobal(position))
+
+    def _delete_item(self, item: QListWidgetItem) -> None:
+        row = self.list_widget.row(item)
+        self.list_widget.takeItem(row)
+        self._save_history_to_disk()
 
     def toggle_pin(self, item) -> None:
         """Toggle the pin status of a clipboard item and reposition it accordingly.
@@ -240,11 +274,15 @@ class ClipboardManager(QWidget):
         self.activateWindow()
 
     def check_clipboard(self) -> None:
-        """Monitor clipboard for changes and add new content to history.
-
-        This method is called periodically by the timer to detect new clipboard content.
-        """
+        """Monitor clipboard and update the real-time display."""
         current_text = self._get_current_clipboard_text()
+
+        # Always update the real-time display widget
+        clean_display = current_text.replace('\n', ' ')
+        if self.current_display.text() != clean_display:
+            self.current_display.setText(clean_display)
+
+        # Logic for adding to history list
         if current_text and current_text.strip() and current_text != self.last_seen_text:
             if self._is_new_clipboard_content(current_text):
                 self.last_seen_text = current_text
@@ -290,6 +328,8 @@ class ClipboardManager(QWidget):
             text = item.data(Qt.ItemDataRole.UserRole)
             self.clipboard.setText(text)
             self.last_seen_text = text
+            # Update the display widget immediately on click
+            self.current_display.setText(text.replace('\n', ' '))
             QTimer.singleShot(self.RESTORE_TIMER_DELAY, self.timer.start)
         except Exception:
             QTimer.singleShot(self.RESTORE_TIMER_DELAY, self.timer.start)
